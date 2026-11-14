@@ -2,22 +2,16 @@ use std::borrow::Cow;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+mod utils;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[allow(clippy::exhaustive_enums)]
 pub enum ParseError {
+    #[error("truncated address")]
     Truncated,
+    #[error("{0}")]
     Invalid(&'static str),
 }
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Truncated => f.write_str("truncated address"),
-            Self::Invalid(message) => f.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for ParseError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::exhaustive_enums)]
@@ -29,31 +23,11 @@ pub enum SocksAddr {
 
 impl SocksAddr {
     pub fn parse_socks(buf: &[u8]) -> Result<(Self, usize), ParseError> {
-        let (addr, consumed) = parse_addr(buf, true)?;
-        let Some(port_bytes) = buf
-            .get(consumed..)
-            .and_then(|tail| tail.get(..2))
-            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
-        else {
-            return Err(ParseError::Truncated);
-        };
-        let port = u16::from_be_bytes(port_bytes);
-        Ok((addr.with_port(port), consumed + port_bytes.len()))
+        Self::parse(buf, true)
     }
 
     pub fn parse_xray(buf: &[u8]) -> Result<(Self, usize), ParseError> {
-        let Some(port_bytes) = buf
-            .get(..2)
-            .and_then(|bytes| <[u8; 2]>::try_from(bytes).ok())
-        else {
-            return Err(ParseError::Truncated);
-        };
-        let Some(address_bytes) = buf.get(2..) else {
-            return Err(ParseError::Truncated);
-        };
-        let port = u16::from_be_bytes(port_bytes);
-        let (addr, consumed) = parse_addr(address_bytes, false)?;
-        Ok((addr.with_port(port), consumed + port_bytes.len()))
+        Self::parse(buf, false)
     }
 
     pub fn host(&self) -> Cow<'_, str> {
@@ -73,86 +47,79 @@ impl SocksAddr {
     }
 
     pub fn is_routable(&self) -> bool {
-        if self.port() == 0 {
-            return false;
-        }
-        match self {
-            Self::V4(_) | Self::V6(_) => true,
-            Self::Domain(host, _) => {
-                let host = host.strip_suffix('.').unwrap_or(host);
-                host.is_ascii()
-                    && host.len() <= 254
-                    && host.split('.').all(|label| {
-                        let label = label.as_bytes();
-                        !label.is_empty()
-                            && label.len() <= 63
-                            && label.first().is_some_and(u8::is_ascii_alphanumeric)
-                            && label.last().is_some_and(u8::is_ascii_alphanumeric)
-                            && label
-                                .iter()
-                                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-                    })
+        self.port() != 0
+            && match self {
+                Self::V4(_) | Self::V6(_) => true,
+                Self::Domain(host, _) => {
+                    host.strip_suffix('.').unwrap_or(host).len() <= 254
+                        && host
+                            .strip_suffix('.')
+                            .unwrap_or(host)
+                            .as_bytes()
+                            .split(|byte| *byte == b'.')
+                            .all(|label| {
+                                label.len() <= 63
+                                    && label.first().is_some_and(u8::is_ascii_alphanumeric)
+                                    && label.last().is_some_and(u8::is_ascii_alphanumeric)
+                                    && label
+                                        .iter()
+                                        .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+                            })
+                }
             }
-        }
     }
 
-    fn with_port(self, port: u16) -> Self {
-        match self {
-            Self::V4(addr) => Self::V4(SocketAddrV4::new(*addr.ip(), port)),
-            Self::Domain(domain, _) => Self::Domain(domain, port),
-            Self::V6(addr) => Self::V6(SocketAddrV6::new(*addr.ip(), port, 0, 0)),
+    fn parse(buf: &[u8], socks: bool) -> Result<(Self, usize), ParseError> {
+        let mut remaining = buf;
+        let mut port = if socks {
+            0
+        } else {
+            u16::from_be_bytes(utils::take(&mut remaining)?)
+        };
+        let mut addr = match (socks, utils::take(&mut remaining)?) {
+            (_, [1]) => Self::V4(SocketAddrV4::new(
+                Ipv4Addr::from(utils::take::<4>(&mut remaining)?),
+                port,
+            )),
+            (true, [3]) | (false, [2]) => {
+                let [len] = utils::take(&mut remaining)?;
+                Self::Domain(
+                    std::str::from_utf8(
+                        remaining
+                            .split_off(..usize::from(len))
+                            .ok_or(ParseError::Truncated)?,
+                    )
+                    .map_err(|_| ParseError::Invalid("invalid domain encoding"))?
+                    .to_owned(),
+                    port,
+                )
+            }
+            (true, [4]) | (false, [3]) => Self::V6(SocketAddrV6::new(
+                Ipv6Addr::from(utils::take::<16>(&mut remaining)?),
+                port,
+                0,
+                0,
+            )),
+            _ => return Err(ParseError::Invalid("invalid address family")),
+        };
+        if socks {
+            port = u16::from_be_bytes(utils::take(&mut remaining)?);
+            match &mut addr {
+                Self::V4(addr) => addr.set_port(port),
+                Self::Domain(_, addr_port) => *addr_port = port,
+                Self::V6(addr) => addr.set_port(port),
+            }
         }
+        Ok((addr, buf.len() - remaining.len()))
     }
 }
 
 impl fmt::Display for SocksAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.host(), self.port())
-    }
-}
-
-fn parse_addr(buf: &[u8], socks_family: bool) -> Result<(SocksAddr, usize), ParseError> {
-    let Some(family) = buf.first().copied() else {
-        return Err(ParseError::Truncated);
-    };
-    let domain_family = if socks_family { 3 } else { 2 };
-    let ipv6_family = if socks_family { 4 } else { 3 };
-    match family {
-        1 => {
-            let Some(octets) = buf
-                .get(1..5)
-                .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
-            else {
-                return Err(ParseError::Truncated);
-            };
-            Ok((
-                SocksAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), 0)),
-                5,
-            ))
+        match self {
+            Self::V4(addr) => write!(f, "{}:{}", addr.ip(), addr.port()),
+            Self::Domain(host, port) => write!(f, "{host}:{port}"),
+            Self::V6(addr) => write!(f, "{}:{}", addr.ip(), addr.port()),
         }
-        family if family == domain_family => {
-            let Some(len) = buf.get(1).copied().map(usize::from) else {
-                return Err(ParseError::Truncated);
-            };
-            let Some(domain_bytes) = buf.get(2..2 + len) else {
-                return Err(ParseError::Truncated);
-            };
-            let domain = std::str::from_utf8(domain_bytes)
-                .map_err(|_| ParseError::Invalid("invalid domain encoding"))?;
-            Ok((SocksAddr::Domain(domain.to_owned(), 0), 2 + len))
-        }
-        family if family == ipv6_family => {
-            let Some(octets) = buf
-                .get(1..17)
-                .and_then(|bytes| <[u8; 16]>::try_from(bytes).ok())
-            else {
-                return Err(ParseError::Truncated);
-            };
-            Ok((
-                SocksAddr::V6(SocketAddrV6::new(Ipv6Addr::from(octets), 0, 0, 0)),
-                17,
-            ))
-        }
-        _ => Err(ParseError::Invalid("invalid address family")),
     }
 }

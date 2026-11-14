@@ -7,6 +7,9 @@ edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Sn0wo2/socksaddr"
 
+[dependencies]
+thiserror = "2.0.21"
+
 [lints.rust]
 unsafe_code = "forbid"
 future_incompatible = { level = "warn", priority = -1 }
