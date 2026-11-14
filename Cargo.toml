@@ -2,7 +2,7 @@
 name = "socksaddr"
 description = "SOCKS and Xray address encoding and decoding"
 readme = "README.md"
-version = "0.0.0"
+version = "0.0.5"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/Sn0wo2/socksaddr"
